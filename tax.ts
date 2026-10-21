@@ -1,15 +1,19 @@
-// Regla fiscal (IVA) para servicios prestados desde Chipre — decisión EN SERVIDOR.
-// Fuente única: https://github.com/cesarboost/nexifair-fiscal (importar siempre por etiqueta de versión).
+// nexifair-fiscal · regla única de IVA para los servicios de Nexifair Limited (ReforLeads y Market).
+// Importar SIEMPRE por etiqueta (inmutable): https://cdn.jsdelivr.net/gh/cesarboost/nexifair-fiscal@vX.Y.Z/tax.ts
 //
-// CRITERIO (confirmado por la asesoría fiscal el 24/08/2026, vigente desde el 01/07/2026): el IVA se
-// determina por el PAÍS del cliente y por si tiene un número de IVA válido en VIES.
-//   · Empresa UE (no-CY) con VAT válido en VIES -> inversión del sujeto pasivo, 0%.
-//   · Cliente en Chipre -> 19% (tenga o no VAT).
-//   · Particular o empresa SIN VIES, dentro de la UE -> IVA del país del cliente
-//     (España 21%, Alemania 19%, Francia 20%, ...), declarado por OSS.
-//   · Canarias/Ceuta/Melilla -> fuera del territorio IVA de la UE -> 0%.
-//   · Fuera de la UE -> no sujeta -> 0%.
-// NO es 21% para todo: cada país de la UE tiene su tipo.
+// v1.1.0 (21/10/2026) — regla al emitir la factura, decidida por el propietario:
+//   · Cliente en Chipre → 19 %.
+//   · Cliente UE con VAT válido en VIES → 0 %, inversión del sujeto pasivo (empresa o autónomo: basta el NIF válido).
+//   · Cliente UE sin VAT válido (empresa o particular) → tipo de su país, OSS (España 21 %).
+//   · Canarias, Ceuta y Melilla → 0 % (fuera del territorio de IVA de la UE).
+//   · Fuera de la UE → 0 %.
+//   · Sin país → NO se decide: `reglaIva` devuelve un problema (la factura no se emite sola). `resolveTax` (cálculo del
+//     importe antes de cobrar, que nunca se bloquea) sigue usando 21 % con aviso.
+//   · España sin código postal → 21 % con aviso (no se puede descartar Canarias).
+//   · Tipos generales revisados contra la tabla oficial de la Comisión Europea (Your Europe, «VAT rules and rates»,
+//     revisada el 13/07/2026): Estonia 24 % (desde 01/07/2025) y Rumanía 21 % (desde 01/08/2025); el resto, sin cambios.
+//   · Grecia: ISO «GR»; la UE y VIES usan «EL». Se aceptan los dos.
+// v1.0.1 (24/08/2026): primera versión común.
 
 export type TaxTreatment =
   | 'cyprus_domestic' | 'es_vat_21' | 'es_out_of_scope'
@@ -18,72 +22,65 @@ export type TaxTreatment =
 export interface TaxInput {
   country_code: string | null;
   postal_code: string | null;
-  customer_type: string | null; // 'empresa' | 'particular'
+  customer_type: string | null; // 'empresa' | 'particular' (informativo desde v1.1.0: no decide el tipo)
   tax_id: string | null;
   vies_valid: boolean | null;
 }
-export interface TaxDecision { treatment: TaxTreatment; rate: number; note: string; }
+
+export interface TaxDecision { treatment: TaxTreatment; rate: number; note: string; aviso?: string; }
+export type IvaRegla = ({ ok: true } & TaxDecision) | { ok: false; problema: string };
 
 export const TAX_INFO: Record<TaxTreatment, { rate: number; note: string }> = {
   cyprus_domestic: { rate: 0.19, note: 'IVA 19% (Chipre)' },
   es_vat_21:       { rate: 0.21, note: 'IVA 21% (España)' },
   es_out_of_scope: { rate: 0,    note: 'Operación no sujeta — Canarias/Ceuta/Melilla' },
   reverse_charge:  { rate: 0,    note: 'Inversión del sujeto pasivo — Art. 196 Directiva 2006/112/CE' },
-  eu_b2c_vat:      { rate: 0,    note: 'IVA del país de destino (OSS)' },   // IVA del país de destino vía OSS desde el 01/07/2026 (criterio confirmado el 24/08/2026)
+  eu_b2c_vat:      { rate: 0,    note: 'IVA del país de destino (OSS)' },
   export_no_eu:    { rate: 0,    note: 'Operación no sujeta — exportación de servicios' },
 };
 
 const EU = new Set(['AT','BE','BG','HR','CY','CZ','DK','EE','FI','FR','DE','GR','HU','IE','IT','LV','LT','LU','MT','NL','PL','PT','RO','SK','SI','ES','SE']);
 const ES_OUT_OF_SCOPE_CP = ['35','38','51','52']; // Canarias, Ceuta, Melilla
-// Tipo general de IVA por país UE (para B2C / sin VIES, vía OSS). Criterio confirmado el 24/08/2026 (vigente desde 01/07/2026).
-const EU_B2C_RATES: Record<string, number> = {
-  AT:0.20, BE:0.21, BG:0.20, HR:0.25, CZ:0.21, DK:0.25, EE:0.22, FI:0.255,
+
+// Tipos generales (fuente: Comisión Europea, Your Europe, revisada el 13/07/2026). España y Chipre se tratan aparte.
+export const EU_B2C_RATES: Record<string, number> = {
+  AT:0.20, BE:0.21, BG:0.20, HR:0.25, CZ:0.21, DK:0.25, EE:0.24, FI:0.255,
   FR:0.20, DE:0.19, GR:0.24, HU:0.27, IE:0.23, IT:0.22, LV:0.21, LT:0.21,
-  LU:0.17, MT:0.18, NL:0.21, PL:0.23, PT:0.23, RO:0.19, SK:0.23, SI:0.22, SE:0.25,
+  LU:0.17, MT:0.18, NL:0.21, PL:0.23, PT:0.23, RO:0.21, SK:0.23, SI:0.22, SE:0.25,
 };
 
-const esEmpresa = (t: string | null) => t === 'empresa';
-const viesValido = (p: TaxInput) =>
-  p.vies_valid === true && !!String(p.tax_id ?? '').trim() && esEmpresa(p.customer_type);
+export const paisIso = (c: string | null) => {
+  const p = String(c ?? '').trim().toUpperCase();
+  return p === 'EL' ? 'GR' : p;
+};
+const viesValido = (p: TaxInput) => p.vies_valid === true && !!String(p.tax_id ?? '').trim();
 
-// Fallback seguro: 21% (España) ante un dato incompleto — nunca conceder 0%
-// por falta de dato, y es el mercado principal.
-function fallback21(motivo: string): TaxDecision {
-  console.warn(`[tax] fallback es_vat_21 (${motivo})`);
-  return { treatment: 'es_vat_21', rate: 0.21, note: TAX_INFO.es_vat_21.note };
-}
-
-export function resolveTax(p: TaxInput): TaxDecision {
-  const pais = String(p.country_code ?? '').trim().toUpperCase();
+/** Regla al emitir. Nunca decide por defecto: sin país devuelve { ok:false, problema }. */
+export function reglaIva(p: TaxInput): IvaRegla {
+  const pais = paisIso(p.country_code);
   const cpRaw = String(p.postal_code ?? '').trim();
-  if (!pais) return fallback21('sin país');
-
-  // 1) Chipre (doméstico) -> 19%.
-  if (pais === 'CY') return { treatment:'cyprus_domestic', rate:0.19, note:TAX_INFO.cyprus_domestic.note };
-
-  // 2) España.
+  if (!pais) return { ok: false, problema: 'falta el país del cliente' };
+  if (pais === 'CY') return { ok: true, treatment: 'cyprus_domestic', rate: 0.19, note: TAX_INFO.cyprus_domestic.note };
   if (pais === 'ES') {
     const cp = cpRaw ? cpRaw.padStart(5, '0') : '';
-    // 2a) Canarias/Ceuta/Melilla: fuera del territorio IVA de la UE -> 0% (fija la etiqueta).
     if (cp && ES_OUT_OF_SCOPE_CP.some((pre) => cp.startsWith(pre)))
-      return { treatment:'es_out_of_scope', rate:0, note:TAX_INFO.es_out_of_scope.note };
-    // 2b) Empresa con VAT válido en VIES -> reverse charge (0%). NO depende del CP:
-    //     con VIES válido el tipo es 0% tanto en península como en Canarias.
-    if (viesValido(p)) return { treatment:'reverse_charge', rate:0, note:TAX_INFO.reverse_charge.note };
-    // 2c) Sin VIES válido y sin CP no podemos descartar Canarias -> 21% (fallback seguro).
-    if (!cpRaw) return fallback21('ES sin código postal');
-    // 2d) Resto: IVA español.
-    return { treatment:'es_vat_21', rate:0.21, note:TAX_INFO.es_vat_21.note };
+      return { ok: true, treatment: 'es_out_of_scope', rate: 0, note: TAX_INFO.es_out_of_scope.note };
+    if (viesValido(p)) return { ok: true, treatment: 'reverse_charge', rate: 0, note: TAX_INFO.reverse_charge.note };
+    return { ok: true, treatment: 'es_vat_21', rate: 0.21, note: TAX_INFO.es_vat_21.note,
+      ...(cpRaw ? {} : { aviso: 'cliente de España sin código postal: se aplica el 21 % (no se puede descartar Canarias, Ceuta o Melilla)' }) };
   }
-
-  // 3) Otro país de la UE.
   if (EU.has(pais)) {
-    if (viesValido(p)) return { treatment:'reverse_charge', rate:0, note:TAX_INFO.reverse_charge.note };
+    if (viesValido(p)) return { ok: true, treatment: 'reverse_charge', rate: 0, note: TAX_INFO.reverse_charge.note };
     const rate = EU_B2C_RATES[pais];
-    if (rate != null) return { treatment:'eu_b2c_vat', rate, note:`IVA ${Math.round(rate*100)}% (${pais}, OSS)` };
-    return fallback21(`UE ${pais} sin tipo en el mapa`);
+    return { ok: true, treatment: 'eu_b2c_vat', rate, note: `IVA ${Math.round(rate * 1000) / 10}% (${pais}, OSS)` };
   }
+  return { ok: true, treatment: 'export_no_eu', rate: 0, note: TAX_INFO.export_no_eu.note };
+}
 
-  // 4) Fuera de la UE -> exportación de servicios, 0%.
-  return { treatment:'export_no_eu', rate:0, note:TAX_INFO.export_no_eu.note };
+/** Cálculo del importe ANTES de cobrar (checkout, presupuesto): nunca bloquea; sin país usa 21 % con aviso. */
+export function resolveTax(p: TaxInput): TaxDecision {
+  const r = reglaIva(p);
+  if (r.ok) { const { ok: _ok, ...d } = r; return d; }
+  console.warn(`[tax] ${r.problema}: se calcula al 21 % (la factura se revisará al emitir)`);
+  return { treatment: 'es_vat_21', rate: 0.21, note: TAX_INFO.es_vat_21.note, aviso: `${r.problema}: calculado al 21 %` };
 }
